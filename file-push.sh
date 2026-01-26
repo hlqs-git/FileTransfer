@@ -1,4 +1,4 @@
-#!/bash/bin
+#!/bin/bash
 # --- 配置 ---
 AUTH="hlqs"
 URL="r2.gmyj.org"
