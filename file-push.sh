@@ -1,7 +1,7 @@
 #!/bin/bash
 # --- 配置 ---
-AUTH="hlqs"
-URL="r2.gmyj.org"
+AUTH="$auth"
+URL="$url"
 CHUNK_SIZE="90M" # 留出 10MB 余量给 Cloudflare 头部
 
 [ -z "$1" ] && { echo "Usage: $0 <file_name>"; exit 1; }
@@ -9,7 +9,7 @@ FILE="$1"
 MANIFEST="manifest.txt"
 
 echo "============================================"
-echo "������ 准备大文件分片上传: $FILE"
+echo "������ 准备大文件分片上传: $FILE"
 echo "============================================"
 
 # 1. 计算总 MD5
