@@ -7,6 +7,7 @@ CHUNK_SIZE="90M" # 留出 10MB 余量给 Cloudflare 头部
 [ -z "$1" ] && { echo "Usage: $0 <file_name>"; exit 1; }
 FILE="$1"
 MANIFEST="manifest.txt"
+FILE_NAME=$(basename -- "$FILE")
 
 echo "============================================"
 echo "������ 准备大文件分片上传: $FILE"
@@ -16,7 +17,7 @@ echo "============================================"
 echo "[1/3] 计算全局 MD5..."
 TOTAL_MD5=$(md5sum "$FILE" | awk '{print $1}')
 echo "HASH:$TOTAL_MD5" > "$MANIFEST"
-echo "NAME:$FILE" >> "$MANIFEST"
+echo "NAME:$FILE_NAME" >> "$MANIFEST"
 
 # 2. 分片
 echo "[2/3] 物理分片中..."

@@ -10,13 +10,14 @@ fi
 
 [ ! -f "$MANIFEST" ] && { echo "错误: 清单不存在"; exit 1; }
 
-ORIG_NAME=$(grep "NAME:" "$MANIFEST" | cut -d':' -f2)
-ORIG_MD5=$(grep "HASH:" "$MANIFEST" | cut -d':' -f2)
+MANIFEST_NAME=$(grep '^NAME:' "$MANIFEST" | cut -d':' -f2-)
+ORIG_NAME=$(basename -- "$MANIFEST_NAME")
+ORIG_MD5=$(grep '^HASH:' "$MANIFEST" | cut -d':' -f2-)
 TMP_DIR="restore_work"
 mkdir -p "$TMP_DIR" && cd "$TMP_DIR"
 
 echo "============================================"
-echo "������ 启动安全恢复: $ORIG_NAME"
+echo "📥 启动安全恢复: $ORIG_NAME"
 echo "============================================"
 
 idx=0
@@ -51,7 +52,7 @@ done
 echo "正在合并并验证总文件..."
 cat p_*.bin > "../$ORIG_NAME"
 cd ..
-FINAL_MD5=$(md5sum "$ORIG_NAME" | awk '{print $1}')
+FINAL_MD5=$(md5sum -- "$ORIG_NAME" | awk '{print $1}')
 
 if [ "$FINAL_MD5" == "$ORIG_MD5" ]; then
     echo "✅ 成功恢复：$ORIG_NAME"
