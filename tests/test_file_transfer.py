@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 
@@ -28,6 +29,10 @@ class LocalTransferServer:
     def __init__(self):
         self.routes = {}
         self.requests = []
+        self.route_calls = {}
+        self.active_requests = 0
+        self.peak_active_requests = 0
+        self.lock = threading.Lock()
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -35,17 +40,24 @@ class LocalTransferServer:
                 return
 
             def _record(self, body=b""):
-                owner.requests.append(
-                    {
-                        "method": self.command,
-                        "path": self.path,
-                        "headers": {key.lower(): value for key, value in self.headers.items()},
-                        "body": body,
-                    }
-                )
+                record = {
+                    "method": self.command,
+                    "path": self.path,
+                    "headers": {key.lower(): value for key, value in self.headers.items()},
+                    "body": body,
+                }
+                with owner.lock:
+                    owner.requests.append(record)
+                return record
 
-            def _respond(self):
+            def _respond(self, record):
                 route = owner.routes.get(self.path, {})
+                with owner.lock:
+                    call_number = owner.route_calls.get(self.path, 0) + 1
+                    owner.route_calls[self.path] = call_number
+                if callable(route):
+                    route = route(record, call_number)
+                time.sleep(route.get("delay", 0))
                 self.send_response(route.get("status", 200))
                 for key, value in route.get("headers", {}).items():
                     self.send_header(key, value)
@@ -55,13 +67,24 @@ class LocalTransferServer:
                 self.wfile.write(body)
 
             def do_GET(self):
-                self._record()
-                self._respond()
+                self._handle(self._record())
 
             def do_PUT(self):
                 length = int(self.headers.get("Content-Length", "0"))
-                self._record(self.rfile.read(length))
-                self._respond()
+                self._handle(self._record(self.rfile.read(length)))
+
+            def _handle(self, record):
+                with owner.lock:
+                    owner.active_requests += 1
+                    owner.peak_active_requests = max(
+                        owner.peak_active_requests,
+                        owner.active_requests,
+                    )
+                try:
+                    self._respond(record)
+                finally:
+                    with owner.lock:
+                        owner.active_requests -= 1
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -326,3 +349,136 @@ class HttpStreamingTests(unittest.TestCase):
             self.ft.download_once(server.url + "/old", destination, "secret", 5)
             self.assertEqual(destination.read_bytes(), b"redirected")
             self.assertEqual(server.requests[1]["headers"]["authorization"], "secret")
+
+
+class PushTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ft = load_module()
+
+    def _push(self, source, manifest_path, server, **overrides):
+        options = {
+            "path": source,
+            "url": server.url + "/upload",
+            "auth": "secret",
+            "manifest_path": manifest_path,
+            "chunk_size": 3,
+            "workers": 4,
+            "expires": 3600,
+            "retry_policy": self.ft.RetryPolicy(
+                max_attempts=3, base_delay=0, max_delay=0
+            ),
+            "progress": lambda *_: None,
+        }
+        options.update(overrides)
+        return self.ft.push_file(**options)
+
+    def test_push_is_concurrent_and_manifest_remains_in_source_order(self):
+        delays = {b"abc": 0.20, b"def": 0.15, b"ghi": 0.10, b"jkl": 0.05}
+
+        def upload_response(record, _):
+            name = record["body"].decode("ascii")
+            return {
+                "delay": delays[record["body"]],
+                "body": f"https://files.test/{name}.bin\n".encode("ascii"),
+            }
+
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            server.routes["/upload"] = upload_response
+            source = Path(directory) / "source.bin"
+            manifest_path = Path(directory) / "manifest.txt"
+            source.write_bytes(b"abcdefghijkl")
+            manifest = self._push(source, manifest_path, server)
+
+            self.assertGreaterEqual(server.peak_active_requests, 2)
+            self.assertEqual([chunk.index for chunk in manifest.chunks], [0, 1, 2, 3])
+            self.assertEqual(
+                [chunk.md5 for chunk in manifest.chunks],
+                [
+                    "900150983cd24fb0d6963f7d28e17f72",
+                    "4ed9407630eb1000c0f6b63842defa7d",
+                    "826bbc5d0522f5f20a1da4b60fa8c871",
+                    "699a474e923b8da5d7aefbfc54a8a2bd",
+                ],
+            )
+            self.assertEqual(
+                [chunk.url for chunk in manifest.chunks],
+                [
+                    "https://files.test/abc.bin",
+                    "https://files.test/def.bin",
+                    "https://files.test/ghi.bin",
+                    "https://files.test/jkl.bin",
+                ],
+            )
+            self.assertEqual(self.ft.parse_manifest(manifest_path.read_text("utf-8")), manifest)
+
+    def test_push_sends_default_expiration_header(self):
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            server.routes["/upload"] = {"body": b"https://files.test/a.bin\n"}
+            source = Path(directory) / "source.bin"
+            source.write_bytes(b"abc")
+            self._push(source, Path(directory) / "manifest.txt", server)
+            self.assertEqual(
+                server.requests[0]["headers"]["x-expiration-seconds"], "3600"
+            )
+
+    def test_push_expires_zero_omits_expiration_header(self):
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            server.routes["/upload"] = {"body": b"https://files.test/a.bin\n"}
+            source = Path(directory) / "source.bin"
+            source.write_bytes(b"abc")
+            self._push(
+                source,
+                Path(directory) / "manifest.txt",
+                server,
+                expires=0,
+            )
+            self.assertNotIn(
+                "x-expiration-seconds", server.requests[0]["headers"]
+            )
+
+    def test_push_empty_file_writes_valid_zero_chunk_manifest(self):
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            source = Path(directory) / "empty.bin"
+            source.write_bytes(b"")
+            manifest_path = Path(directory) / "manifest.txt"
+            manifest = self._push(source, manifest_path, server)
+            self.assertEqual(manifest.file_md5, "d41d8cd98f00b204e9800998ecf8427e")
+            self.assertEqual(manifest.size, 0)
+            self.assertEqual(manifest.chunks, ())
+            self.assertEqual(server.requests, [])
+            self.assertTrue(manifest_path.exists())
+
+    def test_failed_push_does_not_overwrite_existing_manifest(self):
+        def upload_response(record, _):
+            if record["body"] == b"def":
+                return {"status": 500, "body": b"temporary failure"}
+            return {"body": b"https://files.test/ok.bin\n"}
+
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            server.routes["/upload"] = upload_response
+            source = Path(directory) / "source.bin"
+            source.write_bytes(b"abcdef")
+            manifest_path = Path(directory) / "manifest.txt"
+            manifest_path.write_text("old manifest", encoding="utf-8")
+            with self.assertRaises(self.ft.TransferError) as caught:
+                self._push(source, manifest_path, server)
+            self.assertEqual(manifest_path.read_text("utf-8"), "old manifest")
+            self.assertIn("chunk 2", str(caught.exception))
+            self.assertIn("3 attempts", str(caught.exception))
+            failed_requests = [
+                request for request in server.requests if request["body"] == b"def"
+            ]
+            self.assertEqual(len(failed_requests), 3)
+
+    def test_unauthorized_push_stops_without_retry(self):
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            server.routes["/upload"] = {"status": 401, "body": b"Unauthorized"}
+            source = Path(directory) / "source.bin"
+            source.write_bytes(b"abc")
+            manifest_path = Path(directory) / "manifest.txt"
+            with self.assertRaises(self.ft.TransferError) as caught:
+                self._push(source, manifest_path, server)
+            self.assertEqual(len(server.requests), 1)
+            self.assertFalse(manifest_path.exists())
+            self.assertIn("1 attempt", str(caught.exception))

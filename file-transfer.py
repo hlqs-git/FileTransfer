@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import hashlib
 import http.client
@@ -12,7 +13,7 @@ import posixpath
 import re
 import tempfile
 import time
-from typing import Callable, Mapping, TypeVar
+from typing import Callable, Mapping, TypeAlias, TypeVar
 from urllib.parse import urljoin, urlsplit
 
 
@@ -293,6 +294,7 @@ def _is_retryable(error: Exception) -> bool:
 
 
 T = TypeVar("T")
+ProgressCallback: TypeAlias = Callable[[int, int, str, str], None]
 
 
 def run_with_retry(
@@ -304,6 +306,10 @@ def run_with_retry(
         try:
             return operation()
         except Exception as error:
+            try:
+                setattr(error, "attempts", attempt)
+            except (AttributeError, TypeError):
+                pass
             if attempt >= policy.max_attempts or not _is_retryable(error):
                 raise
             retry_after = None
@@ -469,3 +475,109 @@ def download_once(
                 output.write(block)
 
     _request_stream("GET", url, headers, None, None, timeout, consume)
+
+
+def compute_chunk_md5(path: Path, chunk: ChunkSpec) -> str:
+    digest = hashlib.md5()
+    remaining = chunk.length
+    with Path(path).open("rb") as source:
+        source.seek(chunk.offset)
+        while remaining:
+            block = source.read(min(BUFFER_SIZE, remaining))
+            if not block:
+                raise TransferError(
+                    f"source file ended while reading chunk {chunk.index + 1}"
+                )
+            digest.update(block)
+            remaining -= len(block)
+    return digest.hexdigest()
+
+
+def upload_chunk(
+    path: Path,
+    chunk: ChunkSpec,
+    url: str,
+    auth: str | None,
+    expires: int,
+    retry_policy: RetryPolicy,
+) -> ChunkSpec:
+    chunk_md5 = compute_chunk_md5(path, chunk)
+    download_url = run_with_retry(
+        lambda: upload_once(path, chunk, url, auth, expires, 60),
+        retry_policy,
+    )
+    return ChunkSpec(
+        index=chunk.index,
+        offset=chunk.offset,
+        length=chunk.length,
+        md5=chunk_md5,
+        url=download_url,
+    )
+
+
+def push_file(
+    path: Path,
+    url: str,
+    auth: str | None,
+    manifest_path: Path,
+    chunk_size: int,
+    workers: int,
+    expires: int,
+    retry_policy: RetryPolicy,
+    progress: ProgressCallback,
+) -> Manifest:
+    source_path = Path(path)
+    if not source_path.is_file():
+        raise TransferError(f"source file does not exist: {source_path}")
+    file_size = source_path.stat().st_size
+    file_md5 = hash_file(source_path)
+    planned = plan_chunks(file_size, chunk_size)
+    results: list[ChunkSpec | None] = [None] * len(planned)
+
+    if planned:
+        executor = ThreadPoolExecutor(max_workers=workers)
+        futures = {
+            executor.submit(
+                upload_chunk,
+                source_path,
+                chunk,
+                url,
+                auth,
+                expires,
+                retry_policy,
+            ): chunk
+            for chunk in planned
+        }
+        try:
+            for future in as_completed(futures):
+                chunk = futures[future]
+                try:
+                    completed = future.result()
+                except Exception as error:
+                    for pending in futures:
+                        pending.cancel()
+                    attempts = getattr(error, "attempts", 1)
+                    attempt_word = "attempt" if attempts == 1 else "attempts"
+                    raise TransferError(
+                        f"chunk {chunk.index + 1} upload failed after "
+                        f"{attempts} {attempt_word}: {error}"
+                    ) from error
+                results[completed.index] = completed
+                progress(completed.index + 1, len(planned), "upload", "complete")
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    completed_chunks = tuple(result for result in results if result is not None)
+    if len(completed_chunks) != len(planned):
+        raise TransferError("upload ended before every chunk completed")
+    manifest = Manifest(
+        name=safe_basename(str(source_path)),
+        file_md5=file_md5,
+        chunks=completed_chunks,
+        size=file_size,
+        chunk_size=chunk_size,
+        expires=expires,
+        version=2,
+    )
+    atomic_write_text(Path(manifest_path), serialize_manifest(manifest))
+    return manifest
