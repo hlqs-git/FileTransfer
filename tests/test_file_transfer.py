@@ -482,3 +482,177 @@ class PushTests(unittest.TestCase):
             self.assertEqual(len(server.requests), 1)
             self.assertFalse(manifest_path.exists())
             self.assertIn("1 attempt", str(caught.exception))
+
+
+class PullTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ft = load_module()
+
+    def _pull(self, manifest_path, output_path, **overrides):
+        options = {
+            "manifest_path": manifest_path,
+            "output_path": output_path,
+            "auth": "secret",
+            "workers": 4,
+            "retry_policy": self.ft.RetryPolicy(
+                max_attempts=3, base_delay=0, max_delay=0
+            ),
+            "progress": lambda *_: None,
+        }
+        options.update(overrides)
+        return self.ft.pull_manifest(**options)
+
+    def _manifest_text(self, name, file_md5, rows, size, chunk_size=3):
+        lines = [
+            f"HASH:{file_md5}",
+            f"NAME:{name}",
+            "VERSION:2",
+            f"SIZE:{size}",
+            f"CHUNK_SIZE:{chunk_size}",
+            "EXPIRES:3600",
+        ]
+        lines.extend(f"{md5}|{url}" for md5, url in rows)
+        return "\n".join(lines) + "\n"
+
+    def _state_path(self, output_path, manifest_text):
+        key = hashlib.sha256(manifest_text.encode("utf-8")).hexdigest()[:16]
+        return output_path.parent / ".file-transfer" / f"{output_path.name}-{key}"
+
+    def test_pull_downloads_concurrently_and_assembles_in_manifest_order(self):
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            server.routes.update(
+                {
+                    "/c": {"delay": 0.20, "body": b"ccc"},
+                    "/a": {"delay": 0.15, "body": b"aaa"},
+                    "/b": {"delay": 0.10, "body": b"bbb"},
+                }
+            )
+            rows = [
+                ("9df62e693988eb4e1e1444ece0578579", server.url + "/c"),
+                ("47bce5c74f589f4867dbd57e9ca9f808", server.url + "/a"),
+                ("08f8e0260c64418510cefb2b06eee5cd", server.url + "/b"),
+            ]
+            text = self._manifest_text(
+                "archive.bin", "586b0f0c56cba518f29c07085cf80ff7", rows, 9
+            )
+            manifest_path = Path(directory) / "manifest.txt"
+            manifest_path.write_text(text, encoding="utf-8", newline="")
+            output = Path(directory) / "restored.bin"
+            result = self._pull(manifest_path, output)
+            self.assertEqual(result, output)
+            self.assertEqual(output.read_bytes(), b"cccaaabbb")
+            self.assertGreaterEqual(server.peak_active_requests, 2)
+
+    def test_pull_reuses_only_checksum_valid_completed_chunks(self):
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            server.routes["/a"] = {"body": b"aaa"}
+            server.routes["/b"] = {"body": b"bbb"}
+            rows = [
+                ("47bce5c74f589f4867dbd57e9ca9f808", server.url + "/a"),
+                ("08f8e0260c64418510cefb2b06eee5cd", server.url + "/b"),
+            ]
+            text = self._manifest_text(
+                "archive.bin", "6547436690a26a399603a7096e876a2d", rows, 6
+            )
+            manifest_path = Path(directory) / "manifest.txt"
+            manifest_path.write_text(text, encoding="utf-8", newline="")
+            output = Path(directory) / "restored.bin"
+            state = self._state_path(output, text)
+            state.mkdir(parents=True)
+            (state / "part_000000.bin").write_bytes(b"aaa")
+            (state / "part_000001.bin").write_bytes(b"corrupt")
+            self._pull(manifest_path, output)
+            self.assertEqual(output.read_bytes(), b"aaabbb")
+            self.assertEqual([request["path"] for request in server.requests], ["/b"])
+
+    def test_pull_retries_checksum_mismatch(self):
+        def changing_response(_, call_number):
+            return {"body": b"bad" if call_number == 1 else b"aaa"}
+
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            server.routes["/part"] = changing_response
+            rows = [("47bce5c74f589f4867dbd57e9ca9f808", server.url + "/part")]
+            text = self._manifest_text(
+                "archive.bin", "47bce5c74f589f4867dbd57e9ca9f808", rows, 3
+            )
+            manifest_path = Path(directory) / "manifest.txt"
+            manifest_path.write_text(text, encoding="utf-8", newline="")
+            output = Path(directory) / "restored.bin"
+            self._pull(manifest_path, output)
+            self.assertEqual(output.read_bytes(), b"aaa")
+            self.assertEqual(len(server.requests), 2)
+
+    def test_pull_empty_manifest_creates_verified_empty_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            text = self._manifest_text(
+                "empty.bin", "d41d8cd98f00b204e9800998ecf8427e", [], 0
+            )
+            manifest_path = Path(directory) / "manifest.txt"
+            manifest_path.write_text(text, encoding="utf-8", newline="")
+            output = Path(directory) / "restored.bin"
+            self._pull(manifest_path, output)
+            self.assertTrue(output.exists())
+            self.assertEqual(output.stat().st_size, 0)
+
+    def test_final_md5_failure_preserves_existing_destination_and_parts(self):
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            server.routes["/part"] = {"body": b"aaa"}
+            rows = [("47bce5c74f589f4867dbd57e9ca9f808", server.url + "/part")]
+            text = self._manifest_text("archive.bin", "0" * 32, rows, 3)
+            manifest_path = Path(directory) / "manifest.txt"
+            manifest_path.write_text(text, encoding="utf-8", newline="")
+            output = Path(directory) / "restored.bin"
+            output.write_bytes(b"important old file")
+            state = self._state_path(output, text)
+            with self.assertRaises(self.ft.TransferError):
+                self._pull(manifest_path, output)
+            self.assertEqual(output.read_bytes(), b"important old file")
+            self.assertEqual((state / "part_000000.bin").read_bytes(), b"aaa")
+
+    def test_404_is_not_retried_and_preserves_resume_state(self):
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            server.routes["/missing"] = {"status": 404, "body": b"gone"}
+            rows = [
+                ("47bce5c74f589f4867dbd57e9ca9f808", server.url + "/unused"),
+                ("08f8e0260c64418510cefb2b06eee5cd", server.url + "/missing"),
+            ]
+            text = self._manifest_text(
+                "archive.bin", "6547436690a26a399603a7096e876a2d", rows, 6
+            )
+            manifest_path = Path(directory) / "manifest.txt"
+            manifest_path.write_text(text, encoding="utf-8", newline="")
+            output = Path(directory) / "restored.bin"
+            state = self._state_path(output, text)
+            state.mkdir(parents=True)
+            (state / "part_000000.bin").write_bytes(b"aaa")
+            with self.assertRaises(self.ft.TransferError):
+                self._pull(manifest_path, output)
+            self.assertEqual([request["path"] for request in server.requests], ["/missing"])
+            self.assertEqual((state / "part_000000.bin").read_bytes(), b"aaa")
+            self.assertFalse(output.exists())
+
+    def test_output_name_from_windows_legacy_path_is_safe(self):
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            server.routes["/part"] = {"body": b"aaa"}
+            text = (
+                "HASH:47bce5c74f589f4867dbd57e9ca9f808\n"
+                "NAME:C:\\source\\数据 file.bin\n"
+                f"47bce5c74f589f4867dbd57e9ca9f808|{server.url}/part\n"
+            )
+            manifest_path = Path(directory) / "manifest.txt"
+            manifest_path.write_text(text, encoding="utf-8", newline="")
+            unrelated = Path(directory) / ".file-transfer" / "other-state"
+            unrelated.mkdir(parents=True)
+            (unrelated / "keep.bin").write_bytes(b"keep")
+            previous = Path.cwd()
+            try:
+                os.chdir(directory)
+                result = self._pull(manifest_path, None)
+            finally:
+                os.chdir(previous)
+            expected = Path(directory) / "数据 file.bin"
+            self.assertEqual(result, expected)
+            self.assertEqual(expected.read_bytes(), b"aaa")
+            self.assertEqual((unrelated / "keep.bin").read_bytes(), b"keep")
+            self.assertFalse((Path(directory) / "source").exists())

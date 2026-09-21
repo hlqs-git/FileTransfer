@@ -6,11 +6,13 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import hashlib
+import hmac
 import http.client
 import os
 from pathlib import Path
 import posixpath
 import re
+import shutil
 import tempfile
 import time
 from typing import Callable, Mapping, TypeAlias, TypeVar
@@ -473,6 +475,8 @@ def download_once(
                 if not block:
                     break
                 output.write(block)
+            output.flush()
+            os.fsync(output.fileno())
 
     _request_stream("GET", url, headers, None, None, timeout, consume)
 
@@ -581,3 +585,144 @@ def push_file(
     )
     atomic_write_text(Path(manifest_path), serialize_manifest(manifest))
     return manifest
+
+
+def manifest_fingerprint(manifest_text: str) -> str:
+    return hashlib.sha256(manifest_text.encode("utf-8")).hexdigest()[:16]
+
+
+def state_directory(output_path: Path, manifest_text: str) -> Path:
+    output = Path(output_path)
+    return (
+        output.parent
+        / ".file-transfer"
+        / f"{output.name}-{manifest_fingerprint(manifest_text)}"
+    )
+
+
+def _part_path(state_dir: Path, index: int) -> Path:
+    return Path(state_dir) / f"part_{index:06d}.bin"
+
+
+def download_chunk(
+    chunk: ChunkSpec,
+    state_dir: Path,
+    auth: str | None,
+    retry_policy: RetryPolicy,
+) -> Path:
+    if not chunk.url or not chunk.md5:
+        raise ManifestError(f"chunk {chunk.index + 1} is incomplete")
+    state = Path(state_dir)
+    state.mkdir(parents=True, exist_ok=True)
+    completed = _part_path(state, chunk.index)
+    temporary = completed.with_suffix(completed.suffix + ".tmp")
+
+    def operation() -> Path:
+        temporary.unlink(missing_ok=True)
+        try:
+            download_once(chunk.url, temporary, auth, 60)
+            actual = hash_file(temporary)
+            if not hmac.compare_digest(actual, chunk.md5):
+                raise IntegrityError(
+                    f"chunk {chunk.index + 1} checksum mismatch: "
+                    f"expected {chunk.md5}, got {actual}"
+                )
+            os.replace(temporary, completed)
+            return completed
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    return run_with_retry(operation, retry_policy)
+
+
+def pull_manifest(
+    manifest_path: Path,
+    output_path: Path | None,
+    auth: str | None,
+    workers: int,
+    retry_policy: RetryPolicy,
+    progress: ProgressCallback,
+) -> Path:
+    manifest_file = Path(manifest_path)
+    try:
+        with manifest_file.open("r", encoding="utf-8", newline="") as source:
+            manifest_text = source.read()
+    except OSError as error:
+        raise TransferError(f"cannot read manifest {manifest_file}: {error}") from error
+    manifest = parse_manifest(manifest_text)
+    output = Path(output_path) if output_path is not None else Path.cwd() / manifest.name
+    output.parent.mkdir(parents=True, exist_ok=True)
+    state = state_directory(output, manifest_text)
+    state.mkdir(parents=True, exist_ok=True)
+
+    missing = []
+    for chunk in manifest.chunks:
+        part = _part_path(state, chunk.index)
+        if part.is_file() and chunk.md5 and hmac.compare_digest(hash_file(part), chunk.md5):
+            progress(chunk.index + 1, len(manifest.chunks), "download", "reused")
+        else:
+            part.unlink(missing_ok=True)
+            missing.append(chunk)
+
+    if missing:
+        executor = ThreadPoolExecutor(max_workers=workers)
+        futures = {
+            executor.submit(download_chunk, chunk, state, auth, retry_policy): chunk
+            for chunk in missing
+        }
+        try:
+            for future in as_completed(futures):
+                chunk = futures[future]
+                try:
+                    future.result()
+                except Exception as error:
+                    for pending in futures:
+                        pending.cancel()
+                    attempts = getattr(error, "attempts", 1)
+                    attempt_word = "attempt" if attempts == 1 else "attempts"
+                    raise TransferError(
+                        f"chunk {chunk.index + 1} download failed after "
+                        f"{attempts} {attempt_word}: {error}"
+                    ) from error
+                progress(chunk.index + 1, len(manifest.chunks), "download", "complete")
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    temporary_output: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=output.parent,
+            prefix=f".{output.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as assembled:
+            temporary_output = Path(assembled.name)
+            for chunk in manifest.chunks:
+                part = _part_path(state, chunk.index)
+                with part.open("rb") as source:
+                    shutil.copyfileobj(source, assembled, BUFFER_SIZE)
+            assembled.flush()
+            os.fsync(assembled.fileno())
+        actual_md5 = hash_file(temporary_output)
+        if not hmac.compare_digest(actual_md5, manifest.file_md5):
+            raise IntegrityError(
+                f"final checksum mismatch: expected {manifest.file_md5}, got {actual_md5}"
+            )
+        os.replace(temporary_output, output)
+        temporary_output = None
+        shutil.rmtree(state)
+        try:
+            state.parent.rmdir()
+        except OSError:
+            # Other manifests may still have resumable chunks here.
+            pass
+        return output
+    except Exception as error:
+        if isinstance(error, TransferError):
+            raise
+        raise TransferError(f"cannot assemble output {output}: {error}") from error
+    finally:
+        if temporary_output is not None:
+            temporary_output.unlink(missing_ok=True)
