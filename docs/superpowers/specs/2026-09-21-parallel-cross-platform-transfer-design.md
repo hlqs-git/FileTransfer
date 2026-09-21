@@ -6,7 +6,7 @@
 
 成功标准：
 
-- Windows 和 Linux 安装 Python 3 后即可运行，不需要安装第三方包。
+- Windows 和 Linux 安装 Python 3.10 或更高版本后即可运行，不需要安装第三方包。
 - 上传和下载默认使用 4 个工作线程，并允许在 1 到 16 之间配置。
 - 保留分片 MD5 与完整文件 MD5 校验。
 - 兼容当前项目已经生成的 `manifest.txt`。
@@ -31,7 +31,7 @@ python file-transfer.py pull [manifest] [options]
 
 - `--auth TOKEN`：上传或下载认证 Token。
 - `--workers N`：并发工作线程数，默认 4，允许范围 1 到 16。
-- `--retries N`：每个分片的最大尝试次数，默认 3。
+- `--retries N`：首次请求失败后的额外重试次数，默认 2，即每个分片最多尝试 3 次。
 
 认证支持命令参数和环境变量。命令参数优先，环境变量作为默认值：
 
