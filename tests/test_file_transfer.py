@@ -137,6 +137,12 @@ class PrimitiveTests(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(self.ft.ManifestError):
                 self.ft.safe_basename(raw)
 
+    def test_safe_basename_contains_windows_drive_and_rejects_unsafe_names(self):
+        self.assertEqual(self.ft.safe_basename("D:outside.bin"), "outside.bin")
+        for raw in ("file.bin:stream", "CON", "nul.txt", "bad\x01name.bin"):
+            with self.subTest(raw=raw), self.assertRaises(self.ft.ManifestError):
+                self.ft.safe_basename(raw)
+
     def test_plan_chunks_covers_file_without_overlap(self):
         chunks = self.ft.plan_chunks(11, 4)
         self.assertEqual(
@@ -222,6 +228,7 @@ class ManifestTests(unittest.TestCase):
             "HASH:not-md5\nNAME:a\n",
             "HASH:" + "0" * 32 + "\nNAME:..\n",
             "HASH:" + "0" * 32 + "\nNAME:a\nbad chunk\n",
+            "HASH:" + "0" * 32 + "\nNAME:a\n" + "0" * 32 + "|https://files.test:bad/a\n",
         )
         for text in invalid:
             with self.subTest(text=text), self.assertRaises(self.ft.ManifestError):
@@ -259,6 +266,21 @@ class HttpPrimitiveTests(unittest.TestCase):
         ):
             with self.subTest(body=body), self.assertRaises(self.ft.TransferError):
                 self.ft.extract_download_url(body)
+
+    def test_extract_download_url_ignores_malformed_candidates(self):
+        valid = "https://files.test/object.bin?token=abc"
+        for malformed in (
+            "https://files.test:bad/object.bin",
+            "https://files.test:99999/object.bin",
+            "http://[broken",
+        ):
+            with self.subTest(malformed=malformed):
+                self.assertEqual(
+                    self.ft.extract_download_url(f"{malformed}\n{valid}"),
+                    valid,
+                )
+                with self.assertRaises(self.ft.TransferError):
+                    self.ft.extract_download_url(malformed)
 
     def test_retry_uses_three_total_attempts_and_expected_delays(self):
         attempts = []
@@ -660,6 +682,25 @@ class PullTests(unittest.TestCase):
             self.assertEqual((unrelated / "keep.bin").read_bytes(), b"keep")
             self.assertFalse((Path(directory) / "source").exists())
 
+    def test_drive_relative_legacy_name_stays_in_output_directory(self):
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            server.routes["/part"] = {"body": b"aaa"}
+            text = (
+                "HASH:47bce5c74f589f4867dbd57e9ca9f808\n"
+                "NAME:D:outside.bin\n"
+                f"47bce5c74f589f4867dbd57e9ca9f808|{server.url}/part\n"
+            )
+            manifest_path = Path(directory) / "manifest.txt"
+            manifest_path.write_text(text, encoding="utf-8", newline="")
+            previous = Path.cwd()
+            try:
+                os.chdir(directory)
+                result = self._pull(manifest_path, None)
+            finally:
+                os.chdir(previous)
+            self.assertEqual(result.resolve(), (Path(directory) / "outside.bin").resolve())
+            self.assertEqual(result.read_bytes(), b"aaa")
+
 
 class CliTests(unittest.TestCase):
     @classmethod
@@ -720,6 +761,16 @@ class CliTests(unittest.TestCase):
             code = self.ft.main(["pull", "--workers", "17"], {})
         self.assertEqual(code, 2)
         self.assertIn("1 to 16", errors.getvalue())
+
+    def test_malformed_upload_url_returns_usage_error(self):
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            code = self.ft.main(
+                ["push", "archive.bin", "--url", "http://[broken"],
+                {},
+            )
+        self.assertEqual(code, 2)
+        self.assertNotIn("Traceback", errors.getvalue())
 
     def test_cli_passes_custom_transfer_options(self):
         with patch.object(self.ft, "push_file") as push:
@@ -792,6 +843,61 @@ class CliTests(unittest.TestCase):
         self.assertIn("safe failure", errors.getvalue())
         self.assertNotIn("Traceback", errors.getvalue())
         self.assertNotIn("super-secret-token", errors.getvalue())
+
+    def test_http_error_body_cannot_echo_authentication_value(self):
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            source = Path(directory) / "source.bin"
+            source.write_bytes(b"abc")
+            server.routes["/upload"] = {
+                "status": 401,
+                "body": b"invalid authorization: super-secret-token",
+            }
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                code = self.ft.main(
+                    [
+                        "push",
+                        str(source),
+                        "--url",
+                        f"{server.url}/upload",
+                        "--auth",
+                        "super-secret-token",
+                    ],
+                    {},
+                )
+            self.assertEqual(code, 1)
+            self.assertIn("HTTP 401", errors.getvalue())
+            self.assertNotIn("super-secret-token", errors.getvalue())
+
+    def test_expected_filesystem_and_encoding_errors_have_no_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            empty_source = root / "empty.bin"
+            empty_source.write_bytes(b"")
+            blocked_parent = root / "blocked"
+            blocked_parent.write_text("not a directory", encoding="utf-8")
+            bad_manifest = root / "bad-manifest.txt"
+            bad_manifest.write_bytes(b"\xff\xfe")
+
+            cases = (
+                [
+                    "push",
+                    str(empty_source),
+                    "--url",
+                    "https://upload.test",
+                    "--manifest",
+                    str(blocked_parent / "manifest.txt"),
+                ],
+                ["pull", str(bad_manifest)],
+            )
+            for arguments in cases:
+                with self.subTest(arguments=arguments):
+                    errors = io.StringIO()
+                    with redirect_stderr(errors):
+                        code = self.ft.main(arguments, {})
+                    self.assertEqual(code, 1)
+                    self.assertIn("error:", errors.getvalue())
+                    self.assertNotIn("Traceback", errors.getvalue())
 
     def test_cli_push_then_pull_round_trip(self):
         with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:

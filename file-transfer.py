@@ -122,8 +122,17 @@ def parse_size(text: str) -> int:
 
 def safe_basename(value: str) -> str:
     normalized = value.replace("\\", "/")
+    if re.match(r"^[A-Za-z]:", normalized):
+        normalized = normalized[2:]
     name = posixpath.basename(normalized)
     if not name or name in {".", ".."}:
+        raise ManifestError(f"unsafe file name: {value!r}")
+    if (
+        any(ord(character) < 32 or character in '<>:"|?*' for character in name)
+        or name.endswith((" ", "."))
+        or name.split(".", 1)[0].upper()
+        in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+    ):
         raise ManifestError(f"unsafe file name: {value!r}")
     return name
 
@@ -165,6 +174,25 @@ def resolve_setting(
     return cli_value if cli_value is not None else env.get(env_name)
 
 
+def is_valid_http_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+        if parsed.hostname is not None:
+            parsed.hostname.encode("idna")
+    except (UnicodeError, ValueError):
+        return False
+    return (
+        parsed.scheme in {"http", "https"}
+        and bool(parsed.hostname)
+        and (port is None or 1 <= port <= 65535)
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.fragment
+        and not any(ord(character) <= 32 or ord(character) == 127 for character in value)
+    )
+
+
 def _parse_nonnegative_int(key: str, value: str) -> int:
     try:
         parsed = int(value)
@@ -186,7 +214,7 @@ def parse_manifest(text: str) -> Manifest:
             continue
         if "|" in line:
             md5_value, separator, url = line.partition("|")
-            if not separator or not _MD5_PATTERN.fullmatch(md5_value) or not url.startswith(("http://", "https://")):
+            if not separator or not _MD5_PATTERN.fullmatch(md5_value) or not is_valid_http_url(url):
                 raise ManifestError(f"malformed chunk row: {raw_line!r}")
             chunk_rows.append((md5_value.lower(), url))
             continue
@@ -287,11 +315,7 @@ def atomic_write_text(path: Path, text: str, replace=os.replace) -> None:
 
 def extract_download_url(text: str) -> str:
     candidates = re.findall(r"https?://[^\s<>\"']+", text)
-    valid = []
-    for candidate in candidates:
-        parsed = urlsplit(candidate)
-        if parsed.scheme in {"http", "https"} and parsed.hostname:
-            valid.append(candidate)
+    valid = [candidate for candidate in candidates if is_valid_http_url(candidate)]
     if len(valid) != 1:
         raise TransferError(
             f"upload response must contain exactly one download URL; found {len(valid)}"
@@ -360,9 +384,9 @@ class LimitedReader:
 
 
 def _origin(url: str) -> tuple[str, str, int]:
-    parsed = urlsplit(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+    if not is_valid_http_url(url):
         raise TransferError(f"unsupported URL: {url!r}")
+    parsed = urlsplit(url)
     default_port = 443 if parsed.scheme == "https" else 80
     return parsed.scheme, parsed.hostname.lower(), parsed.port or default_port
 
@@ -424,10 +448,10 @@ def _request_stream(
                 current_url = next_url
                 continue
             if not 200 <= response.status <= 299:
-                reason = response.read(4096).decode("utf-8", errors="replace").strip()
+                response.read(4096)
                 raise HTTPStatusError(
                     response.status,
-                    reason or response.reason,
+                    response.reason or "request failed",
                     dict(response.getheaders()),
                 )
             return consume(response)
@@ -798,8 +822,7 @@ def console_progress(index: int, total: int, state: str, detail: str) -> None:
 def _validated_upload_url(value: str | None) -> str:
     if value is None:
         raise CLIUsageError("push requires --url or FILE_TRANSFER_URL")
-    parsed = urlsplit(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+    if not is_valid_http_url(value):
         raise CLIUsageError("--url must be an http or https URL with a hostname")
     return value
 
@@ -847,6 +870,9 @@ def main(
         return 2
     except TransferError as error:
         print(f"error: {error}", file=sys.stderr)
+        return 1
+    except (OSError, UnicodeError) as error:
+        print(f"error: local file operation failed: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("cancelled", file=sys.stderr)
