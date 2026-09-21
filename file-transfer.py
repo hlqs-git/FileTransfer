@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import hashlib
@@ -13,9 +14,11 @@ from pathlib import Path
 import posixpath
 import re
 import shutil
+import sys
 import tempfile
+import threading
 import time
-from typing import Callable, Mapping, TypeAlias, TypeVar
+from typing import Callable, Mapping, Sequence, TypeAlias, TypeVar
 from urllib.parse import urljoin, urlsplit
 
 
@@ -35,6 +38,7 @@ _SIZE_MULTIPLIERS = {
     "GIB": 1024**3,
 }
 _MD5_PATTERN = re.compile(r"^[0-9a-fA-F]{32}$")
+_PROGRESS_LOCK = threading.Lock()
 
 
 class TransferError(Exception):
@@ -60,6 +64,15 @@ class HTTPStatusError(TransferError):
         self.status = status
         self.reason = reason
         self.headers = {key.lower(): value for key, value in (headers or {}).items()}
+
+
+class CLIUsageError(Exception):
+    """Raised for command-line errors that should return exit code 2."""
+
+
+class TransferArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise CLIUsageError(message)
 
 
 @dataclass(frozen=True)
@@ -726,3 +739,119 @@ def pull_manifest(
     finally:
         if temporary_output is not None:
             temporary_output.unlink(missing_ok=True)
+
+
+def _workers_argument(value: str) -> int:
+    try:
+        return positive_workers(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def _nonnegative_argument(value: str) -> int:
+    try:
+        result = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a non-negative integer") from error
+    if result < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return result
+
+
+def _size_argument(value: str) -> int:
+    try:
+        return parse_size(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = TransferArgumentParser(
+        description="Upload and download files in parallel chunks.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    push = commands.add_parser("push", help="upload a file and write its manifest")
+    push.add_argument("file", type=Path, help="file to upload")
+    push.add_argument("--url", help="upload endpoint (or FILE_TRANSFER_URL)")
+    push.add_argument("--auth", help="authorization value (or FILE_TRANSFER_AUTH)")
+    push.add_argument("--manifest", type=Path, default=Path("manifest.txt"))
+    push.add_argument("--chunk-size", type=_size_argument, default=parse_size("90M"))
+    push.add_argument("--workers", type=_workers_argument, default=4)
+    push.add_argument("--retries", type=_nonnegative_argument, default=2)
+    push.add_argument("--expires", type=_nonnegative_argument, default=3600)
+
+    pull = commands.add_parser("pull", help="download and assemble a manifest")
+    pull.add_argument("manifest", type=Path, nargs="?", default=Path("manifest.txt"))
+    pull.add_argument("--output", type=Path)
+    pull.add_argument("--auth", help="authorization value (or FILE_TRANSFER_AUTH)")
+    pull.add_argument("--workers", type=_workers_argument, default=4)
+    pull.add_argument("--retries", type=_nonnegative_argument, default=2)
+    return parser
+
+
+def console_progress(index: int, total: int, state: str, detail: str) -> None:
+    with _PROGRESS_LOCK:
+        print(f"[{index}/{total}] {state} {detail}", file=sys.stderr, flush=True)
+
+
+def _validated_upload_url(value: str | None) -> str:
+    if value is None:
+        raise CLIUsageError("push requires --url or FILE_TRANSFER_URL")
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise CLIUsageError("--url must be an http or https URL with a hostname")
+    return value
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    env: Mapping[str, str] | None = None,
+) -> int:
+    parser = build_parser()
+    environment = os.environ if env is None else env
+    try:
+        arguments = parser.parse_args(argv)
+        auth = resolve_setting(arguments.auth, "FILE_TRANSFER_AUTH", environment)
+        retry_policy = RetryPolicy(max_attempts=arguments.retries + 1)
+        if arguments.command == "push":
+            url = _validated_upload_url(
+                resolve_setting(arguments.url, "FILE_TRANSFER_URL", environment)
+            )
+            push_file(
+                path=arguments.file,
+                url=url,
+                auth=auth,
+                manifest_path=arguments.manifest,
+                chunk_size=arguments.chunk_size,
+                workers=arguments.workers,
+                expires=arguments.expires,
+                retry_policy=retry_policy,
+                progress=console_progress,
+            )
+            print(arguments.manifest)
+        else:
+            output = pull_manifest(
+                manifest_path=arguments.manifest,
+                output_path=arguments.output,
+                auth=auth,
+                workers=arguments.workers,
+                retry_policy=retry_policy,
+                progress=console_progress,
+            )
+            print(output)
+        return 0
+    except CLIUsageError as error:
+        parser.print_usage(sys.stderr)
+        print(f"{parser.prog}: error: {error}", file=sys.stderr)
+        return 2
+    except TransferError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("cancelled", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

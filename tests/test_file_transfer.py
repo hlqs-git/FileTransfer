@@ -3,6 +3,7 @@ from __future__ import annotations
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hashlib
 import importlib.util
+import io
 import os
 from pathlib import Path
 import sys
@@ -10,6 +11,8 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
+from contextlib import redirect_stderr, redirect_stdout
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -656,3 +659,188 @@ class PullTests(unittest.TestCase):
             self.assertEqual(expected.read_bytes(), b"aaa")
             self.assertEqual((unrelated / "keep.bin").read_bytes(), b"keep")
             self.assertFalse((Path(directory) / "source").exists())
+
+
+class CliTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ft = load_module()
+
+    def test_push_cli_prefers_flags_over_environment(self):
+        with patch.object(self.ft, "push_file") as push:
+            code = self.ft.main(
+                [
+                    "push",
+                    "archive.bin",
+                    "--url",
+                    "https://command.test",
+                    "--auth",
+                    "command-token",
+                ],
+                {
+                    "FILE_TRANSFER_URL": "https://environment.test",
+                    "FILE_TRANSFER_AUTH": "environment-token",
+                },
+            )
+        self.assertEqual(code, 0)
+        arguments = push.call_args.kwargs
+        self.assertEqual(arguments["url"], "https://command.test")
+        self.assertEqual(arguments["auth"], "command-token")
+        self.assertEqual(arguments["workers"], 4)
+        self.assertEqual(arguments["expires"], 3600)
+        self.assertEqual(arguments["chunk_size"], 90 * 1024 * 1024)
+        self.assertEqual(arguments["retry_policy"].max_attempts, 3)
+
+    def test_push_requires_url_but_allows_empty_auth(self):
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            missing_code = self.ft.main(["push", "archive.bin"], {})
+        self.assertEqual(missing_code, 2)
+        self.assertIn("--url", errors.getvalue())
+        with patch.object(self.ft, "push_file") as push:
+            code = self.ft.main(
+                ["push", "archive.bin", "--url", "https://upload.test"],
+                {},
+            )
+        self.assertEqual(code, 0)
+        self.assertIsNone(push.call_args.kwargs["auth"])
+
+    def test_pull_defaults_manifest_and_output(self):
+        with patch.object(self.ft, "pull_manifest", return_value=Path("archive.bin")) as pull:
+            code = self.ft.main(["pull"], {})
+        self.assertEqual(code, 0)
+        arguments = pull.call_args.kwargs
+        self.assertEqual(arguments["manifest_path"], Path("manifest.txt"))
+        self.assertIsNone(arguments["output_path"])
+        self.assertEqual(arguments["workers"], 4)
+
+    def test_invalid_workers_returns_usage_error(self):
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            code = self.ft.main(["pull", "--workers", "17"], {})
+        self.assertEqual(code, 2)
+        self.assertIn("1 to 16", errors.getvalue())
+
+    def test_cli_passes_custom_transfer_options(self):
+        with patch.object(self.ft, "push_file") as push:
+            push_code = self.ft.main(
+                [
+                    "push",
+                    "archive.bin",
+                    "--url",
+                    "https://upload.test",
+                    "--manifest",
+                    "custom.txt",
+                    "--chunk-size",
+                    "8M",
+                    "--workers",
+                    "8",
+                    "--retries",
+                    "4",
+                    "--expires",
+                    "7200",
+                ],
+                {},
+            )
+        self.assertEqual(push_code, 0)
+        push_arguments = push.call_args.kwargs
+        self.assertEqual(push_arguments["manifest_path"], Path("custom.txt"))
+        self.assertEqual(push_arguments["chunk_size"], 8 * 1024 * 1024)
+        self.assertEqual(push_arguments["workers"], 8)
+        self.assertEqual(push_arguments["retry_policy"].max_attempts, 5)
+        self.assertEqual(push_arguments["expires"], 7200)
+
+        with patch.object(
+            self.ft, "pull_manifest", return_value=Path("restored.bin")
+        ) as pull:
+            pull_code = self.ft.main(
+                [
+                    "pull",
+                    "manifest.txt",
+                    "--output",
+                    "restored.bin",
+                    "--workers",
+                    "6",
+                    "--retries",
+                    "1",
+                ],
+                {},
+            )
+        self.assertEqual(pull_code, 0)
+        pull_arguments = pull.call_args.kwargs
+        self.assertEqual(pull_arguments["output_path"], Path("restored.bin"))
+        self.assertEqual(pull_arguments["workers"], 6)
+        self.assertEqual(pull_arguments["retry_policy"].max_attempts, 2)
+
+    def test_transfer_error_returns_one_without_traceback_or_token(self):
+        errors = io.StringIO()
+        with patch.object(
+            self.ft, "push_file", side_effect=self.ft.TransferError("safe failure")
+        ), redirect_stderr(errors):
+            code = self.ft.main(
+                [
+                    "push",
+                    "archive.bin",
+                    "--url",
+                    "https://upload.test",
+                    "--auth",
+                    "super-secret-token",
+                ],
+                {},
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("safe failure", errors.getvalue())
+        self.assertNotIn("Traceback", errors.getvalue())
+        self.assertNotIn("super-secret-token", errors.getvalue())
+
+    def test_cli_push_then_pull_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            source = Path(directory) / "source data.bin"
+            manifest = Path(directory) / "manifest.txt"
+            destination = Path(directory) / "restored data.bin"
+            source.write_bytes(b"abcdefghijkl")
+
+            def upload(record, call_number):
+                object_path = f"/object/{call_number}"
+                with server.lock:
+                    server.routes[object_path] = {"body": record["body"]}
+                return {"body": f"{server.url}{object_path}\n".encode()}
+
+            server.routes["/upload"] = upload
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                push_code = self.ft.main(
+                    [
+                        "push",
+                        str(source),
+                        "--url",
+                        f"{server.url}/upload",
+                        "--manifest",
+                        str(manifest),
+                        "--chunk-size",
+                        "4",
+                        "--workers",
+                        "3",
+                    ],
+                    {},
+                )
+                pull_code = self.ft.main(
+                    [
+                        "pull",
+                        str(manifest),
+                        "--output",
+                        str(destination),
+                        "--workers",
+                        "3",
+                    ],
+                    {},
+                )
+
+            self.assertEqual(push_code, 0)
+            self.assertEqual(pull_code, 0)
+            self.assertEqual(
+                hashlib.md5(source.read_bytes()).hexdigest(),
+                hashlib.md5(destination.read_bytes()).hexdigest(),
+            )
+            methods = [request["method"] for request in server.requests]
+            self.assertGreaterEqual(methods.count("PUT"), 2)
+            self.assertGreaterEqual(methods.count("GET"), 2)
