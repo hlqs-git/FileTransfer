@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hashlib
 import importlib.util
 import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 
 
@@ -20,6 +22,63 @@ def load_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+class LocalTransferServer:
+    def __init__(self):
+        self.routes = {}
+        self.requests = []
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                return
+
+            def _record(self, body=b""):
+                owner.requests.append(
+                    {
+                        "method": self.command,
+                        "path": self.path,
+                        "headers": {key.lower(): value for key, value in self.headers.items()},
+                        "body": body,
+                    }
+                )
+
+            def _respond(self):
+                route = owner.routes.get(self.path, {})
+                self.send_response(route.get("status", 200))
+                for key, value in route.get("headers", {}).items():
+                    self.send_header(key, value)
+                body = route.get("body", b"")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                self._record()
+                self._respond()
+
+            def do_PUT(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                self._record(self.rfile.read(length))
+                self._respond()
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    @property
+    def url(self):
+        host, port = self.server.server_address
+        return f"http://{host}:{port}"
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
 
 
 class PrimitiveTests(unittest.TestCase):
@@ -154,3 +213,116 @@ class ManifestTests(unittest.TestCase):
                 self.ft.atomic_write_text(target, "new", replace=blocked_replace)
             self.assertEqual(target.read_text(encoding="utf-8"), "old")
             self.assertEqual(list(Path(directory).glob("*.tmp")), [])
+
+
+class HttpPrimitiveTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ft = load_module()
+
+    def test_extracts_one_http_or_https_download_url(self):
+        self.assertEqual(
+            self.ft.extract_download_url(
+                "uploaded\nhttps://r2.test/a.bin\nexpires soon"
+            ),
+            "https://r2.test/a.bin",
+        )
+        for body in (
+            "no link",
+            "http://a.test/x.bin https://b.test/y.bin",
+        ):
+            with self.subTest(body=body), self.assertRaises(self.ft.TransferError):
+                self.ft.extract_download_url(body)
+
+    def test_retry_uses_three_total_attempts_and_expected_delays(self):
+        attempts = []
+        delays = []
+
+        def operation():
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise OSError("temporary")
+            return "ok"
+
+        result = self.ft.run_with_retry(
+            operation,
+            self.ft.RetryPolicy(max_attempts=3, base_delay=1, max_delay=30),
+            delays.append,
+        )
+        self.assertEqual(result, "ok")
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(delays, [1, 2])
+
+    def test_authentication_and_not_found_are_not_retried(self):
+        for status in (401, 403, 404):
+            calls = []
+
+            def operation(status=status):
+                calls.append(status)
+                raise self.ft.HTTPStatusError(status, "failure")
+
+            with self.subTest(status=status), self.assertRaises(
+                self.ft.HTTPStatusError
+            ):
+                self.ft.run_with_retry(
+                    operation,
+                    self.ft.RetryPolicy(),
+                    lambda _: None,
+                )
+            self.assertEqual(calls, [status])
+
+
+class HttpStreamingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ft = load_module()
+
+    def test_upload_once_streams_exact_range_and_headers(self):
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            source = Path(directory) / "source.bin"
+            source.write_bytes(b"0123456789")
+            server.routes["/upload"] = {
+                "body": b"uploaded\nhttps://r2.test/result.bin\n"
+            }
+            chunk = self.ft.ChunkSpec(0, 3, 4)
+            result = self.ft.upload_once(
+                source, chunk, server.url + "/upload", "secret", 3600, 5
+            )
+            self.assertEqual(result, "https://r2.test/result.bin")
+            request = server.requests[0]
+            self.assertEqual(request["body"], b"3456")
+            self.assertEqual(request["headers"]["content-length"], "4")
+            self.assertEqual(request["headers"]["authorization"], "secret")
+            self.assertEqual(request["headers"]["x-expiration-seconds"], "3600")
+
+    def test_download_once_writes_response_to_temporary_path(self):
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            destination = Path(directory) / "part.tmp"
+            server.routes["/part"] = {"body": b"hello"}
+            self.ft.download_once(server.url + "/part", destination, None, 5)
+            self.assertEqual(destination.read_bytes(), b"hello")
+
+    def test_cross_origin_redirect_drops_authorization(self):
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as first, LocalTransferServer() as second:
+            destination = Path(directory) / "part.tmp"
+            first.routes["/old"] = {
+                "status": 302,
+                "headers": {"Location": second.url + "/new"},
+            }
+            second.routes["/new"] = {"body": b"redirected"}
+            self.ft.download_once(first.url + "/old", destination, "secret", 5)
+            self.assertEqual(destination.read_bytes(), b"redirected")
+            self.assertEqual(first.requests[0]["headers"]["authorization"], "secret")
+            self.assertNotIn("authorization", second.requests[0]["headers"])
+
+    def test_same_origin_redirect_keeps_authorization(self):
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            destination = Path(directory) / "part.tmp"
+            server.routes["/old"] = {
+                "status": 302,
+                "headers": {"Location": "/new"},
+            }
+            server.routes["/new"] = {"body": b"redirected"}
+            self.ft.download_once(server.url + "/old", destination, "secret", 5)
+            self.assertEqual(destination.read_bytes(), b"redirected")
+            self.assertEqual(server.requests[1]["headers"]["authorization"], "secret")
