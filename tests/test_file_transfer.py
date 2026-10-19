@@ -950,3 +950,110 @@ class CliTests(unittest.TestCase):
             methods = [request["method"] for request in server.requests]
             self.assertGreaterEqual(methods.count("PUT"), 2)
             self.assertGreaterEqual(methods.count("GET"), 2)
+
+class ProgressTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ft = load_module()
+
+    def test_retry_resets_only_failed_chunk_and_reused_bytes_have_no_speed(self):
+        output = io.StringIO()
+        progress = self.ft.TransferProgress(stream=output, clock=lambda: 10.0)
+        progress.configure('download', 100, 2)
+        progress.reuse(0, 40)
+        progress.update(1, 30)
+        progress.reset(1)
+        self.assertEqual(progress.transferred, 40)
+        progress.update(1, 60)
+        progress.finish()
+        self.assertEqual(progress.transferred, 100)
+        self.assertIn('100.0%', output.getvalue())
+        self.assertIn('ETA', output.getvalue())
+
+    def test_unknown_size_does_not_invent_percentage(self):
+        output = io.StringIO()
+        progress = self.ft.TransferProgress(stream=output)
+        progress.configure('download', None, 1)
+        progress.update(0, 123)
+        progress.phase('verifying')
+        self.assertNotIn('%', output.getvalue())
+        self.assertIn('123 B', output.getvalue())
+
+    def test_streaming_callbacks_report_before_completion(self):
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            source = Path(directory) / 'source'
+            source.write_bytes(b'abcdefgh')
+            server.routes['/upload'] = {'body': b'https://files.test/result'}
+            sent = []
+            self.ft.upload_once(source, self.ft.ChunkSpec(0, 0, 8),
+                                server.url + '/upload', None, 3600, 5, sent.append)
+            self.assertEqual(sum(sent), 8)
+            server.routes['/part'] = {'body': b'abcdefgh'}
+            received = []
+            self.ft.download_once(server.url + '/part', Path(directory) / 'out',
+                                  None, 5, received.append)
+            self.assertEqual(sum(received), 8)
+
+    def test_tty_refreshes_in_place_and_redirected_output_is_throttled(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+        now = [0.0]
+        for terminal in (False, True):
+            with self.subTest(terminal=terminal):
+                stream = Terminal() if terminal else io.StringIO()
+                progress = self.ft.TransferProgress(stream, clock=lambda: now[0])
+                progress.configure('upload', 100, 1)
+                baseline = stream.getvalue()
+                progress.update(0, 10)
+                self.assertEqual(stream.getvalue(), baseline)
+                now[0] += 5
+                progress.update(0, 10)
+                progress.finish()
+                text = stream.getvalue()
+                self.assertIn('20.0%', text)
+                self.assertEqual('\r' in text, terminal)
+                self.assertTrue(text.endswith('\n'))
+
+    def test_download_retry_does_not_double_count_bytes(self):
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            server.routes['/part'] = lambda _, call: {'body': b'bad' if call == 1 else b'aaa'}
+            progress = self.ft.TransferProgress(io.StringIO())
+            progress.configure('download', 3, 1)
+            chunk = self.ft.ChunkSpec(0, 0, 3, hashlib.md5(b'aaa').hexdigest(), server.url + '/part')
+            self.ft.download_chunk(chunk, Path(directory), None,
+                                   self.ft.RetryPolicy(base_delay=0), progress)
+            self.assertEqual(progress.transferred, 3)
+            self.assertEqual(progress.traffic, 6)
+            self.assertIn('retrying', progress.stream.getvalue())
+
+    def test_upload_redirect_does_not_double_count_bytes(self):
+        with tempfile.TemporaryDirectory() as directory, LocalTransferServer() as server:
+            source = Path(directory) / 'source'
+            source.write_bytes(b'aaa')
+            server.routes['/redirect'] = {'status': 307, 'headers': {'Location': '/upload'}}
+            server.routes['/upload'] = {'body': b'https://files.test/part'}
+            progress = self.ft.TransferProgress(io.StringIO())
+            progress.configure('upload', 3, 1)
+            self.ft.upload_chunk(source, self.ft.ChunkSpec(0, 0, 3), server.url + '/redirect',
+                                 None, 3600, self.ft.RetryPolicy(base_delay=0), progress)
+            self.assertEqual(progress.transferred, 3)
+            self.assertEqual(progress.traffic, 6)
+
+    def test_download_reports_available_bytes_without_waiting_for_full_buffer(self):
+        class Response:
+            def __init__(self):
+                self.blocks = [b'abc', b'def', b'']
+
+            def read1(self, size):
+                return self.blocks.pop(0)
+            def read(self, size):
+                raise AssertionError('buffered read delays progress')
+        with tempfile.TemporaryDirectory() as directory:
+            amounts = []
+            def request(method, url, headers, factory, length, timeout, consume):
+                consume(Response())
+            with patch.object(self.ft, '_request_stream', side_effect=request):
+                self.ft.download_once('http://files.test/part', Path(directory) / 'part',
+                                      None, 5, amounts.append)
+            self.assertEqual(amounts, [3, 3])

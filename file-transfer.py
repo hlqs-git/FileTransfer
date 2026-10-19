@@ -336,6 +336,110 @@ T = TypeVar("T")
 ProgressCallback: TypeAlias = Callable[[int, int, str, str], None]
 
 
+def format_bytes(value: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(value) < 1024 or unit == "TiB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    raise AssertionError("unreachable")
+
+
+class TransferProgress:
+    """Thread-safe aggregate of current attempts, separate from network traffic."""
+
+    def __init__(self, stream=None, clock=time.monotonic):
+        self.stream = sys.stderr if stream is None else stream
+        self.clock = clock
+        self.lock = threading.RLock()
+        self.parts = {}
+        self.done = set()
+        self.traffic = 0
+        self.started = clock()
+        self.last_render = float("-inf")
+        self.total = None
+        self.count = 0
+        self.state = "preparing"
+        self.direction = "transfer"
+        self.width = 0
+        self.tty = self.stream.isatty()
+
+    @property
+    def transferred(self):
+        with self.lock:
+            return sum(self.parts.values())
+
+    def configure(self, direction, total, count):
+        with self.lock:
+            self.direction, self.total, self.count = direction, total, count
+            self.started = self.clock()
+            self.phase("preparing")
+
+    def update(self, index, amount):
+        with self.lock:
+            self.parts[index] = self.parts.get(index, 0) + amount
+            self.traffic += amount
+            self.state = "transferring"
+            self.render()
+
+    def reset(self, index):
+        with self.lock:
+            previous = self.parts.pop(index, 0)
+            if previous:
+                self.phase(f"retrying chunk {index + 1}")
+
+    def reuse(self, index, amount):
+        with self.lock:
+            self.parts[index] = amount
+            self.done.add(index)
+            self.phase("reusing verified chunks")
+
+    def complete(self, index):
+        with self.lock:
+            self.done.add(index)
+            self.render(force=True)
+
+    def phase(self, state):
+        with self.lock:
+            self.state = state
+            self.render(force=True)
+
+    def finish(self):
+        self.phase("complete")
+        self.close()
+
+    def close(self):
+        with self.lock:
+            if self.tty and self.width:
+                print(file=self.stream, flush=True)
+                self.width = 0
+
+    def render(self, force=False):
+        now = self.clock()
+        if not force and now - self.last_render < (0.2 if self.tty else 5.0):
+            return
+        self.last_render = now
+        amount = self.transferred
+        elapsed = max(0, now - self.started)
+        speed = self.traffic / elapsed if elapsed else 0
+        size = format_bytes(amount)
+        eta = "--"
+        bar = ""
+        if self.total is not None:
+            fraction = min(1.0, amount / self.total) if self.total else (1.0 if self.state == "complete" else 0.0)
+            filled = int(fraction * 20)
+            bar = f"[{'#' * filled}{'-' * (20 - filled)}] {fraction * 100:5.1f}% "
+            size += f" / {format_bytes(self.total)}"
+            if speed > 0:
+                eta = f"{max(0, self.total - amount) / speed:.0f}s"
+        line = (f"{self.direction} {bar}{size} | {format_bytes(speed)}/s | "
+                f"ETA {eta} | elapsed {elapsed:.0f}s | chunks {len(self.done)}/{self.count} | {self.state}")
+        if self.tty:
+            print("\r" + line.ljust(self.width), end="", file=self.stream, flush=True)
+            self.width = len(line)
+        else:
+            print(line, file=self.stream, flush=True)
+
+
 def run_with_retry(
     operation: Callable[[], T],
     policy: RetryPolicy,
@@ -407,6 +511,7 @@ def _request_stream(
     content_length: int | None,
     timeout: float,
     consume,
+    on_bytes=None,
 ):
     current_url = url
     current_headers = dict(headers)
@@ -426,12 +531,16 @@ def _request_stream(
                 connection.putheader("Content-Length", str(content_length))
             connection.endheaders()
             if body_factory is not None:
+                if on_bytes:
+                    on_bytes(0)
                 body = body_factory()
                 while True:
                     block = body.read(BUFFER_SIZE)
                     if not block:
                         break
                     connection.send(block)
+                    if on_bytes:
+                        on_bytes(len(block))
             response = connection.getresponse()
             if response.status in {301, 302, 303, 307, 308}:
                 location = response.getheader("Location")
@@ -471,6 +580,7 @@ def upload_once(
     auth: str | None,
     expires: int,
     timeout: float,
+    on_bytes=None,
 ) -> str:
     headers = {"Content-Type": "application/octet-stream"}
     if auth:
@@ -494,6 +604,7 @@ def upload_once(
         chunk.length,
         timeout,
         consume,
+        on_bytes,
     )
 
 
@@ -502,16 +613,19 @@ def download_once(
     destination: Path,
     auth: str | None,
     timeout: float,
+    on_bytes=None,
 ) -> None:
     headers = {"Authorization": auth} if auth else {}
 
     def consume(response) -> None:
         with Path(destination).open("wb") as output:
             while True:
-                block = response.read(BUFFER_SIZE)
+                block = response.read1(BUFFER_SIZE)
                 if not block:
                     break
                 output.write(block)
+                if on_bytes:
+                    on_bytes(len(block))
             output.flush()
             os.fsync(output.fileno())
 
@@ -541,10 +655,23 @@ def upload_chunk(
     auth: str | None,
     expires: int,
     retry_policy: RetryPolicy,
+    byte_progress=None,
 ) -> ChunkSpec:
     chunk_md5 = compute_chunk_md5(path, chunk)
+
+    def operation():
+        if byte_progress:
+            byte_progress.reset(chunk.index)
+            def report(amount):
+                if amount == 0:
+                    byte_progress.reset(chunk.index)
+                else:
+                    byte_progress.update(chunk.index, amount)
+            return upload_once(path, chunk, url, auth, expires, 60, report)
+        return upload_once(path, chunk, url, auth, expires, 60)
+
     download_url = run_with_retry(
-        lambda: upload_once(path, chunk, url, auth, expires, 60),
+        operation,
         retry_policy,
     )
     return ChunkSpec(
@@ -566,13 +693,17 @@ def push_file(
     expires: int,
     retry_policy: RetryPolicy,
     progress: ProgressCallback,
+    byte_progress=None,
 ) -> Manifest:
     source_path = Path(path)
     if not source_path.is_file():
         raise TransferError(f"source file does not exist: {source_path}")
     file_size = source_path.stat().st_size
-    file_md5 = hash_file(source_path)
     planned = plan_chunks(file_size, chunk_size)
+    if byte_progress:
+        byte_progress.configure("upload", file_size, len(planned))
+        byte_progress.phase("hashing source")
+    file_md5 = hash_file(source_path)
     results: list[ChunkSpec | None] = [None] * len(planned)
 
     if planned:
@@ -586,6 +717,7 @@ def push_file(
                 auth,
                 expires,
                 retry_policy,
+                byte_progress,
             ): chunk
             for chunk in planned
         }
@@ -604,7 +736,10 @@ def push_file(
                         f"{attempts} {attempt_word}: {error}"
                     ) from error
                 results[completed.index] = completed
-                progress(completed.index + 1, len(planned), "upload", "complete")
+                if byte_progress:
+                    byte_progress.complete(completed.index)
+                else:
+                    progress(completed.index + 1, len(planned), "upload", "complete")
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
 
@@ -620,7 +755,11 @@ def push_file(
         expires=expires,
         version=2,
     )
+    if byte_progress:
+        byte_progress.phase("writing manifest")
     atomic_write_text(Path(manifest_path), serialize_manifest(manifest))
+    if byte_progress:
+        byte_progress.finish()
     return manifest
 
 
@@ -646,6 +785,7 @@ def download_chunk(
     state_dir: Path,
     auth: str | None,
     retry_policy: RetryPolicy,
+    byte_progress=None,
 ) -> Path:
     if not chunk.url or not chunk.md5:
         raise ManifestError(f"chunk {chunk.index + 1} is incomplete")
@@ -657,7 +797,12 @@ def download_chunk(
     def operation() -> Path:
         temporary.unlink(missing_ok=True)
         try:
-            download_once(chunk.url, temporary, auth, 60)
+            if byte_progress:
+                byte_progress.reset(chunk.index)
+                download_once(chunk.url, temporary, auth, 60,
+                              lambda amount: byte_progress.update(chunk.index, amount))
+            else:
+                download_once(chunk.url, temporary, auth, 60)
             actual = hash_file(temporary)
             if not hmac.compare_digest(actual, chunk.md5):
                 raise IntegrityError(
@@ -680,6 +825,7 @@ def pull_manifest(
     workers: int,
     retry_policy: RetryPolicy,
     progress: ProgressCallback,
+    byte_progress=None,
 ) -> Path:
     manifest_file = Path(manifest_path)
     try:
@@ -693,11 +839,17 @@ def pull_manifest(
     state = state_directory(output, manifest_text)
     state.mkdir(parents=True, exist_ok=True)
 
+    if byte_progress:
+        byte_progress.configure("download", manifest.size, len(manifest.chunks))
+        byte_progress.phase("checking resume state")
     missing = []
     for chunk in manifest.chunks:
         part = _part_path(state, chunk.index)
         if part.is_file() and chunk.md5 and hmac.compare_digest(hash_file(part), chunk.md5):
-            progress(chunk.index + 1, len(manifest.chunks), "download", "reused")
+            if byte_progress:
+                byte_progress.reuse(chunk.index, part.stat().st_size)
+            else:
+                progress(chunk.index + 1, len(manifest.chunks), "download", "reused")
         else:
             part.unlink(missing_ok=True)
             missing.append(chunk)
@@ -705,7 +857,7 @@ def pull_manifest(
     if missing:
         executor = ThreadPoolExecutor(max_workers=workers)
         futures = {
-            executor.submit(download_chunk, chunk, state, auth, retry_policy): chunk
+            executor.submit(download_chunk, chunk, state, auth, retry_policy, byte_progress): chunk
             for chunk in missing
         }
         try:
@@ -722,10 +874,15 @@ def pull_manifest(
                         f"chunk {chunk.index + 1} download failed after "
                         f"{attempts} {attempt_word}: {error}"
                     ) from error
-                progress(chunk.index + 1, len(manifest.chunks), "download", "complete")
+                if byte_progress:
+                    byte_progress.complete(chunk.index)
+                else:
+                    progress(chunk.index + 1, len(manifest.chunks), "download", "complete")
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
 
+    if byte_progress:
+        byte_progress.phase("assembling output")
     temporary_output: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -742,6 +899,8 @@ def pull_manifest(
                     shutil.copyfileobj(source, assembled, BUFFER_SIZE)
             assembled.flush()
             os.fsync(assembled.fileno())
+        if byte_progress:
+            byte_progress.phase("verifying output")
         actual_md5 = hash_file(temporary_output)
         if not hmac.compare_digest(actual_md5, manifest.file_md5):
             raise IntegrityError(
@@ -755,6 +914,8 @@ def pull_manifest(
         except OSError:
             # Other manifests may still have resumable chunks here.
             pass
+        if byte_progress:
+            byte_progress.finish()
         return output
     except Exception as error:
         if isinstance(error, TransferError):
@@ -833,6 +994,7 @@ def main(
 ) -> int:
     parser = build_parser()
     environment = os.environ if env is None else env
+    byte_progress = TransferProgress()
     try:
         arguments = parser.parse_args(argv)
         auth = resolve_setting(arguments.auth, "FILE_TRANSFER_AUTH", environment)
@@ -851,6 +1013,7 @@ def main(
                 expires=arguments.expires,
                 retry_policy=retry_policy,
                 progress=console_progress,
+                byte_progress=byte_progress,
             )
             print(arguments.manifest)
         else:
@@ -861,20 +1024,25 @@ def main(
                 workers=arguments.workers,
                 retry_policy=retry_policy,
                 progress=console_progress,
+                byte_progress=byte_progress,
             )
             print(output)
         return 0
     except CLIUsageError as error:
+        byte_progress.close()
         parser.print_usage(sys.stderr)
         print(f"{parser.prog}: error: {error}", file=sys.stderr)
         return 2
     except TransferError as error:
+        byte_progress.close()
         print(f"error: {error}", file=sys.stderr)
         return 1
     except (OSError, UnicodeError) as error:
+        byte_progress.close()
         print(f"error: local file operation failed: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
+        byte_progress.close()
         print("cancelled", file=sys.stderr)
         return 130
 
