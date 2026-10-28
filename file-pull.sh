@@ -1,63 +1,120 @@
 #!/bin/bash
-
-MANIFEST="manifest.txt"
-# 1. 自动开启 BBR 优化（如果未开启）
-if [[ $(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}') != "bbr" ]]; then
-    echo "提示: 检测到未开启 BBR，正在尝试临时优化网络..."
-    sudo sysctl -w net.core.default_qdisc=fq > /dev/null 2>&1
-    sudo sysctl -w net.ipv4.tcp_congestion_control=bbr > /dev/null 2>&1
+# Linux download client: Bash 4.2+, curl 7.29+, GNU coreutils.
+set -eo pipefail
+umask 077
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$SCRIPT_DIR/file-transfer-common.sh"
+usage() {
+    cat <<'EOF'
+Usage: file-pull.sh [MANIFEST] [--output PATH] [--auth VALUE] [--retries 2]
+Environment: FILE_TRANSFER_MANIFEST, FILE_TRANSFER_OUTPUT,
+             FILE_TRANSFER_AUTH, FILE_TRANSFER_RETRIES
+Verified chunks are reused from the output directory's .file-transfer/ folder.
+EOF
+}
+init_config
+parse_args pull "$@"
+(( ${#POSITIONAL[@]} == 0 )) || MANIFEST=${POSITIONAL[0]}
+[[ -f $MANIFEST && -r $MANIFEST ]] || die '清单不存在或不可读'
+for cmd in dirname basename wc sleep rmdir; do need "$cmd"; done
+# Snapshot the manifest once so validation, state identity and transfer agree.
+TEXT=$(cat -- "$MANIFEST")
+HASH= NAME= VERSION= SIZE= CHUNK_SIZE= EXPIRES=
+SEEN='|'
+HASHES=(); URLS=()
+while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    [[ -n $line ]] || continue
+    if [[ $line == *'|'* ]]; then
+        digest=${line%%|*}; link=${line#*|}
+        valid_hash "$digest" && valid_url "$link" || die '清单包含无效分片 MD5 或链接'
+        HASHES+=("${digest,,}"); URLS+=("$link")
+    else
+        [[ $line == *:* ]] || die '清单行格式错误'
+        key=${line%%:*}; value=${line#*:}
+        case "$key" in HASH|NAME|VERSION|SIZE|CHUNK_SIZE|EXPIRES) ;; *) die "未知清单字段: $key" ;; esac
+        [[ $SEEN != *"|$key|"* ]] || die "清单包含重复字段: $key"
+        SEEN+="$key|"
+        case "$key" in
+            HASH) HASH=${value,,} ;; NAME) NAME=$value ;;
+            VERSION|SIZE|CHUNK_SIZE|EXPIRES)
+                number "$key" "$value"
+                printf -v "$key" '%s' "$NUMBER" ;;
+        esac
+    fi
+done <<< "$TEXT"
+valid_hash "$HASH" || die '清单缺少有效 HASH'
+safe_name "$NAME"
+[[ -n $OUTPUT ]] || OUTPUT=$SAFE_NAME
+[[ -z $VERSION || $VERSION == 1 || $VERSION == 2 ]] || die '不支持的清单版本'
+[[ -z $CHUNK_SIZE || $CHUNK_SIZE -gt 0 ]] || die '清单分片大小必须大于零'
+if [[ $VERSION == 2 ]]; then
+    [[ -n $SIZE && -n $CHUNK_SIZE && -n $EXPIRES ]] || die '版本 2 清单缺少元数据'
+    expected=$((SIZE / CHUNK_SIZE + (SIZE % CHUNK_SIZE != 0)))
+    (( expected == ${#HASHES[@]} )) || die '清单分片数量与文件大小不匹配'
 fi
-
-[ ! -f "$MANIFEST" ] && { echo "错误: 清单不存在"; exit 1; }
-
-MANIFEST_NAME=$(grep '^NAME:' "$MANIFEST" | cut -d':' -f2-)
-ORIG_NAME=$(basename -- "$MANIFEST_NAME")
-ORIG_MD5=$(grep '^HASH:' "$MANIFEST" | cut -d':' -f2-)
-TMP_DIR="restore_work"
-mkdir -p "$TMP_DIR" && cd "$TMP_DIR"
-
-echo "============================================"
-echo "📥 启动安全恢复: $ORIG_NAME"
-echo "============================================"
-
-idx=0
-# 仅解析 MD5|URL 格式的行
-grep "|" "../$MANIFEST" | while read -r line; do
-    idx=$((idx + 1))
-    T_MD5=$(echo "$line" | cut -d'|' -f1)
-    URL=$(echo "$line" | cut -d'|' -f2)
-    OUT=$(printf "p_%03d.bin" $idx)
-
-    echo -n "[分片 $idx] 正在传输... "
-    # 使用最通用的短参数：
-    # -L (跟随重定向), -k (忽略证书错误), -f (HTTP错误时报错)
-    # -y 10 -Y 30 (低速限时重试)
-    #curl -L -k -f -y 10 -Y 30 --connect-timeout 60 -o "$OUT" "$URL"
-    curl -L -k -f -H "Authorization: hlqs" -y 10 -Y 30 --connect-timeout 60 -o "$OUT" "$URL"
-
-    if [ $? -ne 0 ]; then
-        echo "❌ 失败！链接可能已在本次请求中失效。"
-        exit 1
+if (( ${#HASHES[@]} == 0 )); then
+    [[ $HASH == d41d8cd98f00b204e9800998ecf8427e && ( -z $SIZE || $SIZE == 0 ) ]] || die '非空文件的清单缺少分片'
+fi
+[[ $EXPIRES != 0 ]] || log '提示: 一次性下载链接可能无法重试或恢复。'
+[[ ! -d $OUTPUT ]] || die '输出路径不能是目录'
+[[ ! -e $OUTPUT || ! $MANIFEST -ef $OUTPUT ]] || die '输出路径不能覆盖清单'
+OUT_DIR=$(CDPATH= cd -- "$(dirname -- "$OUTPUT")" && pwd) || die '输出目录不存在'
+OUT_NAME=$(basename -- "$OUTPUT")
+[[ $OUT_NAME != . && $OUT_NAME != .. && $OUT_NAME != *[[:cntrl:]]* ]] || die '输出文件名无效'
+TARGET="$OUT_DIR/$OUT_NAME"
+FINGERPRINT=$(printf '%s\n%s' "$TEXT" "$OUT_NAME" | md5sum | awk '{print $1}')
+ROOT="$OUT_DIR/.file-transfer"
+[[ ! -L $ROOT ]] || die '状态目录不能是符号链接'
+mkdir -p -- "$ROOT"
+STATE="$ROOT/shell-$FINGERPRINT"
+[[ ! -L $STATE ]] || die '分片状态目录不能是符号链接'
+mkdir -p -- "$STATE"
+LOCK="$STATE/lock"
+mkdir -- "$LOCK" 2>/dev/null || die "同一下载已在运行或上次异常退出遗留锁: $LOCK；确认无任务后可手动 rmdir"
+ASSEMBLY=
+cleanup() {
+    [[ -z $ASSEMBLY ]] || rm -f -- "$ASSEMBLY"
+    rm -f -- "$STATE/incoming"
+    rmdir -- "$LOCK" 2>/dev/null || :
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+PARTS=()
+for ((idx=0; idx<${#HASHES[@]}; idx++)); do
+    printf -v part '%s/p_%012d' "$STATE" "$idx"
+    [[ ! -L $part ]] || die '缓存分片不能是符号链接'
+    PARTS+=("$part")
+    if [[ -f $part && $(hash_file "$part") == "${HASHES[idx]}" ]]; then
+        log "分片 $((idx + 1))/${#HASHES[@]} 已校验，复用"
+        continue
     fi
-
-    # 下载完立刻校验，防止坏包
-    C_MD5=$(md5sum "$OUT" | awk '{print $1}')
-    if [ "$T_MD5" != "$C_MD5" ]; then
-        echo "❌ 校验失败！分片损坏。"
-        exit 1
-    fi
-    echo "OK"
+    attempt=0
+    while :; do
+        rm -f -- "$STATE/incoming"
+        if request GET "${URLS[idx]}" "$STATE/incoming" && [[ $(hash_file "$STATE/incoming") == "${HASHES[idx]}" ]]; then
+            mv -fT -- "$STATE/incoming" "$part"
+            break
+        fi
+        rm -f -- "$STATE/incoming"
+        retry_delay "$attempt" || die "分片 $((idx + 1)) 下载或校验失败（HTTP ${HTTP_STATUS:-未知}）；已验证分片保留供重试"
+        attempt=$((attempt + 1))
+    done
+    log "分片 $((idx + 1))/${#HASHES[@]} 下载完成"
 done
-
-echo "正在合并并验证总文件..."
-cat p_*.bin > "../$ORIG_NAME"
-cd ..
-FINAL_MD5=$(md5sum -- "$ORIG_NAME" | awk '{print $1}')
-
-if [ "$FINAL_MD5" == "$ORIG_MD5" ]; then
-    echo "✅ 成功恢复：$ORIG_NAME"
-    rm -rf "$TMP_DIR"
-else
-    echo "❌ 最终文件 MD5 不匹配！"
-    exit 1
-fi
+log '合并并校验完整文件...'
+ASSEMBLY=$(mktemp "$OUT_DIR/.file-transfer-output.XXXXXXXX")
+for part in "${PARTS[@]}"; do cat -- "$part" >> "$ASSEMBLY"; done
+[[ $(hash_file "$ASSEMBLY") == "$HASH" ]] || die '最终文件 MD5 不匹配，原目标未替换'
+[[ -z $SIZE || $(wc -c < "$ASSEMBLY") -eq $SIZE ]] || die '最终文件大小不匹配，原目标未替换'
+mv -fT -- "$ASSEMBLY" "$TARGET"
+ASSEMBLY=
+for part in "${PARTS[@]}"; do rm -f -- "$part"; done
+# Remove only this invocation's files, never recursively delete download state.
+cleanup
+trap - EXIT
+rmdir -- "$STATE" 2>/dev/null || :
+rmdir -- "$ROOT" 2>/dev/null || :
+log '恢复完成，完整文件校验通过。'
+printf '%s\n' "$OUTPUT"
