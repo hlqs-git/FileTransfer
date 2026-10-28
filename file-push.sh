@@ -9,8 +9,10 @@ usage() {
     cat <<'EOF'
 Usage: file-push.sh FILE [--url URL] [--auth VALUE] [--manifest PATH]
                          [--chunk-size 90M] [--retries 2] [--expires 3600]
+                         [--low-speed-time 120]
 Environment: FILE_TRANSFER_URL, FILE_TRANSFER_AUTH, FILE_TRANSFER_MANIFEST,
              FILE_TRANSFER_CHUNK_SIZE, FILE_TRANSFER_RETRIES, FILE_TRANSFER_EXPIRES
+             FILE_TRANSFER_LOW_SPEED_TIME (seconds; 0 disables low-speed timeout)
 Legacy upload settings: url, auth. Use -- before a filename starting with '-'.
 EOF
 }

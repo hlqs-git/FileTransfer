@@ -52,6 +52,7 @@ init_config() {
     MANIFEST=${FILE_TRANSFER_MANIFEST-manifest.txt}
     CHUNK_SIZE=${FILE_TRANSFER_CHUNK_SIZE-90M}
     RETRIES=${FILE_TRANSFER_RETRIES-2}
+    LOW_SPEED_TIME=${FILE_TRANSFER_LOW_SPEED_TIME-120}
     EXPIRES=${FILE_TRANSFER_EXPIRES-3600}
     OUTPUT=${FILE_TRANSFER_OUTPUT-}
     POSITIONAL=()
@@ -64,7 +65,7 @@ parse_args() {
         case "$key" in
             -h|--help) usage; exit 0 ;;
             --) POSITIONAL+=("$@"); break ;;
-            --auth|--retries|--output|--url|--manifest|--chunk-size|--expires)
+            --auth|--retries|--output|--url|--manifest|--chunk-size|--expires|--low-speed-time)
                 (( $# )) || usage_error "$key 缺少值"
                 case "$mode:$key" in
                     push:--output|pull:--url|pull:--manifest|pull:--chunk-size|pull:--expires) usage_error "不支持参数 $key" ;;
@@ -72,6 +73,7 @@ parse_args() {
                 case "$key" in
                     --auth) AUTH=$1 ;; --retries) RETRIES=$1 ;; --output) OUTPUT=$1 ;;
                     --url) URL=$1 ;; --manifest) MANIFEST=$1 ;; --chunk-size) CHUNK_SIZE=$1 ;; --expires) EXPIRES=$1 ;;
+                    --low-speed-time) LOW_SPEED_TIME=$1 ;;
                 esac
                 shift ;;
             -*) usage_error "未知参数 $key；以 - 开头的文件请使用 ./文件名 或 --" ;;
@@ -81,9 +83,17 @@ parse_args() {
     (( ${#POSITIONAL[@]} <= 1 )) || usage_error '只接受一个输入文件'
     number '--retries' "$RETRIES"; RETRIES=$NUMBER
     (( RETRIES <= 100 )) || usage_error '重试次数不能超过 100'
+    number '--low-speed-time' "$LOW_SPEED_TIME"; LOW_SPEED_TIME=$NUMBER
+    (( LOW_SPEED_TIME <= 2147483647 )) || usage_error '低速超时时间过大'
     [[ $AUTH != *[[:cntrl:]]* ]] || usage_error '认证值不能包含控制字符'
     local cmd
     for cmd in curl md5sum awk mktemp mv mkdir rm cat; do need "$cmd"; done
+    # --http1.1 appeared in curl 7.33; stock 7.29 already uses HTTP/1.1.
+    # Probe option support locally, without contacting any server.
+    HTTP1_ARGS=()
+    if curl -q --http1.1 --version >/dev/null 2>&1; then
+        HTTP1_ARGS=(--http1.1)
+    fi
 }
 
 # Writes response/body into $3. Only successful 2xx responses are accepted.
@@ -94,8 +104,11 @@ request() {
     origin=${BASH_REMATCH[0],,}
     HTTP_STATUS=
     for ((hop=0; hop<=5; hop++)); do
-        local args=(-q -g -sS -f --connect-timeout 30 --speed-time 30 --speed-limit 30
+        # HTTP/2 negotiation can fail on older client/proxy/server combinations.
+        local args=(-q -g "${HTTP1_ARGS[@]}" -sS -f --connect-timeout 30
             --proto '=http,https' -o "$destination" -w $'%{http_code}\n%{redirect_url}')
+        # Allow time for the upload service to finish processing a large PUT.
+        (( LOW_SPEED_TIME == 0 )) || args+=(--speed-time "$LOW_SPEED_TIME" --speed-limit 30)
         [[ $request_url =~ ^https?://[^/?#]+ ]] || return 1
         current=${BASH_REMATCH[0],,}
         # Old curl versions can forward custom auth headers across origins with -L.

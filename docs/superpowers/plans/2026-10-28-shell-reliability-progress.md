@@ -14,3 +14,11 @@
 - Verification: full combined Python suite passed: 62 tests, 0 failures (original 50 plus 12 real HTTP integration tests). Final nine-group offline suite passed with `BASH_COMPAT=42`; syntax checks and `git diff --check` passed. `git diff --exit-code -- file-transfer.py` confirms the Python implementation is unchanged.
 - Task 3: complete. README documents deployment of all three Shell files, CLI/environment configuration, retries, recovery, locking, expiration and runtime limitations. Changes left uncommitted for user review.
 - Limitation: Git Bash compatibility mode is not a substitute for execution on real CentOS 7 Bash 4.2/curl 7.29. No target Linux distribution was available in this workspace.
+
+## Follow-up: HTTP/2 upload failure
+
+- User evidence: curl 7.76.1/nghttp2 1.43.0 failed the original 90 MiB upload with low-speed timeout and HTTP/2 PROTOCOL_ERROR. Explicit HTTP/1.1 without low-speed detection uploaded a real 90 MiB chunk successfully (HTTP 200, 43.968309 seconds). These tests do not isolate the original low-speed timeout's cause.
+- Fix: prefer HTTP/1.1; detect `--http1.1` support locally so stock curl 7.29 remains supported. Increase default low-speed window from 30 to 120 seconds and expose `--low-speed-time` / `FILE_TRANSFER_LOW_SPEED_TIME`, with 0 disabling speed checks. Total duration is not a low-speed threshold.
+- RED: simulated HTTP/2 transport rejected the original request options. New curl-7.29 fixture also rejected an unconditional `--http1.1`; capability detection addresses this independently reviewed compatibility finding.
+- Regression cases: HTTP/1.1 request selection, old-curl fallback, timeout defaults, explicit override, disabled speed detection, invalid values rejected before network access.
+- Final verification: 62 Python/HTTP tests passed; 11 offline Shell groups passed with BASH_COMPAT=42; syntax and diff checks passed; Python implementation diff empty. Independent re-review found no remaining concrete issues.

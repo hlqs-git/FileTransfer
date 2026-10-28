@@ -7,8 +7,10 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 usage() {
     cat <<'EOF'
 Usage: file-pull.sh [MANIFEST] [--output PATH] [--auth VALUE] [--retries 2]
+                   [--low-speed-time 120]
 Environment: FILE_TRANSFER_MANIFEST, FILE_TRANSFER_OUTPUT,
              FILE_TRANSFER_AUTH, FILE_TRANSFER_RETRIES
+             FILE_TRANSFER_LOW_SPEED_TIME (seconds; 0 disables low-speed timeout)
 Verified chunks are reused from the output directory's .file-transfer/ folder.
 EOF
 }
